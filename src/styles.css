@@ -74,7 +74,6 @@ button {
     max(24px, env(safe-area-inset-right)) max(24px, env(safe-area-inset-bottom))
     max(24px, env(safe-area-inset-left));
   background: var(--splash);
-  transition: opacity 180ms ease-out, visibility 180ms linear;
 }
 
 #boot-splash .boot-content {
@@ -97,12 +96,6 @@ button {
   line-height: 1.6;
 }
 
-#boot-splash.is-hidden {
-  visibility: hidden;
-  opacity: 0;
-  pointer-events: none;
-}
-
 .sr-only {
   position: absolute;
   width: 1px;
@@ -112,10 +105,4 @@ button {
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  #boot-splash {
-    transition: none;
-  }
 }

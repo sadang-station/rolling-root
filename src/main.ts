@@ -7,7 +7,7 @@ import {
   Text,
   type Texture,
 } from "pixi.js";
-import { sound } from "@pixi/sound";
+import { sound, type IMediaInstance } from "@pixi/sound";
 
 // The Unity scene is a 16:9 orthographic composition: a white field, one
 // 13.6-degree plane, a fixed player, and obstacles that drift up the plane.
@@ -207,6 +207,11 @@ class RollingRootGame {
   private gameOverFaceElapsed = 0;
   private isJumping = false;
   private audioUnlocked = false;
+  private audioResumePromise: Promise<boolean> | null = null;
+  private startCuePending = false;
+  private bgmInstance: IMediaInstance | null = null;
+  private bgmStarting = false;
+  private bgmRequestId = 0;
   private bootDismissed = false;
   private lastScreenWidth = 0;
   private lastScreenHeight = 0;
@@ -457,7 +462,9 @@ class RollingRootGame {
         PLAYER_ROLL_RADIANS_PER_SECOND * speedMultiplier * delta) %
       (Math.PI * 2);
     this.player.rotation = this.playerRollAngle;
-    sound.speed("bgm", speedMultiplier);
+    if (this.bgmInstance) {
+      sound.speed("bgm", speedMultiplier);
+    }
     this.updatePlayerPhysics(delta);
     this.updateObstacles(delta, speedMultiplier);
     this.updateBicycleSpawner(delta);
@@ -741,12 +748,16 @@ class RollingRootGame {
   }
 
   private jump(): void {
-    this.unlockAudio();
+    const audioReady = this.unlockAudio();
     if (this.isJumping) return;
 
     this.isJumping = true;
     this.playerVelocityY = JUMP_VELOCITY;
-    this.playEffect("jump");
+    void audioReady.then((ready) => {
+      if (ready && this.state === "play") {
+        this.playEffect("jump");
+      }
+    });
     this.setStatus("점프!");
   }
 
@@ -782,6 +793,8 @@ class RollingRootGame {
     this.isJumping = false;
     this.player.position.set(PLAYER_X, playerGroundY());
     this.player.rotation = this.playerRollAngle;
+    this.stopBgm();
+    this.startCuePending = false;
     sound.stopAll();
     sound.speed("bgm", 1);
     this.updateCamera();
@@ -807,8 +820,11 @@ class RollingRootGame {
     this.state = "play";
     this.pauseLayer.visible = false;
     this.audioUnlocked = true;
-    this.resumeAudioContext();
-    this.playBgm();
+    void this.resumeAudioContext().then((ready) => {
+      if (ready && this.state === "play") {
+        this.startBgm();
+      }
+    });
     this.setStatus("게임을 계속합니다.");
   }
 
@@ -816,7 +832,7 @@ class RollingRootGame {
     if (this.state !== "play") return;
 
     this.state = "game-over";
-    sound.stop("bgm");
+    this.stopBgm();
     this.playEffect("die");
     this.pauseLayer.visible = false;
     this.gameOverFaceElapsed = 0;
@@ -831,71 +847,175 @@ class RollingRootGame {
     );
   }
 
-  private unlockAudio(): void {
+  private unlockAudio(): Promise<boolean> {
     const firstUnlock = !this.audioUnlocked;
     this.audioUnlocked = true;
-    this.resumeAudioContext();
-    if (this.state === "play") {
-      if (firstUnlock) {
-        this.playEffect("start");
+    return this.resumeAudioContext().then((ready) => {
+      if (!ready || this.state !== "play") {
+        return false;
       }
-      this.playBgm();
-    }
+
+      if (firstUnlock) {
+        this.playStartCue();
+      } else if (!this.startCuePending) {
+        this.startBgm();
+      }
+
+      return true;
+    });
   }
 
   private startRoundAudio(): void {
     this.audioUnlocked = true;
-    this.resumeAudioContext();
-    if (this.state === "play") {
-      this.playEffect("start");
-      this.playBgm();
-    }
+    void this.resumeAudioContext().then((ready) => {
+      if (ready && this.state === "play") {
+        this.playStartCue();
+      }
+    });
   }
 
   private playEffect(name: EffectSoundName): void {
     if (!this.audioUnlocked) return;
 
-    this.playSound(name);
+    const playback = sound.play(name, { singleInstance: true });
+    if (playback instanceof Promise) {
+      void playback.catch((error: unknown) => this.handleAudioError(error));
+    }
   }
 
-  private playBgm(): void {
-    if (!this.audioUnlocked) {
+  private playStartCue(): void {
+    if (!this.audioUnlocked || this.state !== "play") {
       return;
     }
 
-    const bgm = sound.find("bgm");
-    if (bgm.paused) {
-      sound.resume("bgm");
-    }
+    this.startCuePending = true;
+    sound.stop("start");
+    const playback = sound.play("start", {
+      singleInstance: true,
+      complete: () => {
+        this.startCuePending = false;
+        if (this.state === "play") {
+          this.startBgm();
+        }
+      },
+    });
 
-    if (!bgm.isPlaying) {
-      this.playSound("bgm");
+    if (playback instanceof Promise) {
+      void playback.catch((error: unknown) => {
+        this.startCuePending = false;
+        this.handleAudioError(error);
+        if (this.state === "play") {
+          this.startBgm();
+        }
+      });
     }
   }
 
-  private playSound(name: SoundName): void {
-    const result = sound.play(name);
-    if (result instanceof Promise) {
-      void result.catch((error: unknown) => this.handleAudioError(error));
+  private startBgm(): void {
+    if (
+      !this.audioUnlocked ||
+      this.state !== "play" ||
+      this.startCuePending ||
+      this.bgmInstance ||
+      this.bgmStarting
+    ) {
+      return;
     }
+
+    const requestId = ++this.bgmRequestId;
+    this.bgmStarting = true;
+    sound.stop("bgm");
+    sound.speed("bgm", this.getSpeedMultiplier());
+    const playback = sound.play("bgm", {
+      loop: true,
+      singleInstance: true,
+    });
+
+    if (playback instanceof Promise) {
+      void playback
+        .then((instance) => this.registerBgmInstance(instance, requestId))
+        .catch((error: unknown) => {
+          if (requestId === this.bgmRequestId) {
+            this.bgmStarting = false;
+          }
+          this.handleAudioError(error);
+        });
+      return;
+    }
+
+    this.registerBgmInstance(playback, requestId);
   }
 
-  private resumeAudioContext(): void {
-    if (sound.supported) {
-      const audioContext = sound.context.audioContext;
-      if (
-        audioContext.state === "suspended" ||
-        audioContext.state === "interrupted"
-      ) {
-        // This call must stay inside the tap/key handler. Pixi Sound then
-        // refreshes its instances against the same resumed context below.
-        void audioContext.resume().catch((error: unknown) =>
-          this.handleAudioError(error),
-        );
+  private registerBgmInstance(
+    instance: IMediaInstance,
+    requestId: number,
+  ): void {
+    if (
+      requestId !== this.bgmRequestId ||
+      !this.audioUnlocked ||
+      this.state !== "play"
+    ) {
+      instance.stop();
+      return;
+    }
+
+    this.bgmStarting = false;
+    this.bgmInstance?.stop();
+    this.bgmInstance = instance;
+    instance.once("stop", () => {
+      if (this.bgmInstance === instance) {
+        this.bgmInstance = null;
       }
+    });
+  }
+
+  private stopBgm(): void {
+    this.bgmRequestId += 1;
+    this.bgmStarting = false;
+    const instance = this.bgmInstance;
+    this.bgmInstance = null;
+    instance?.stop();
+    sound.stop("bgm");
+  }
+
+  private resumeAudioContext(): Promise<boolean> {
+    if (!sound.supported) {
+      sound.resumeAll();
+      return Promise.resolve(true);
     }
 
-    sound.resumeAll();
+    const audioContext = sound.context.audioContext;
+    if (audioContext.state === "running") {
+      sound.resumeAll();
+      return Promise.resolve(true);
+    }
+
+    if (this.audioResumePromise) {
+      return this.audioResumePromise;
+    }
+
+    // Call resume synchronously from the tap/key handler, then wait before
+    // creating one-shot sources. Safari otherwise can drop the first sound.
+    this.audioResumePromise = audioContext
+      .resume()
+      .then(() => {
+        if (this.state !== "play") {
+          sound.pauseAll();
+          return false;
+        }
+
+        sound.resumeAll();
+        return true;
+      })
+      .catch((error: unknown) => {
+        this.handleAudioError(error);
+        return false;
+      })
+      .finally(() => {
+        this.audioResumePromise = null;
+      });
+
+    return this.audioResumePromise;
   }
 
   private pauseActiveSounds(): void {
@@ -903,7 +1023,8 @@ class RollingRootGame {
       return;
     }
 
-    sound.pause("bgm");
+    this.startCuePending = false;
+    this.stopBgm();
     (Object.keys(SOUND_SOURCES) as SoundName[])
       .filter((name): name is EffectSoundName => name !== "bgm")
       .forEach((name) => sound.stop(name));
@@ -921,7 +1042,9 @@ class RollingRootGame {
     if (this.bootDismissed) return;
 
     this.bootDismissed = true;
-    this.bootSplash.classList.add("is-hidden");
+    // Removing the layer avoids a stale red compositing surface on iOS Safari.
+    this.bootSplash.setAttribute("aria-hidden", "true");
+    this.bootSplash.remove();
   }
 
   private layoutWorld(): void {
