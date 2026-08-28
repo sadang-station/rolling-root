@@ -31,10 +31,13 @@ const ICECREAM_SPAWN_X = 2_550;
 const FIRST_ICECREAM_DELAY = 5;
 const ICECREAM_SPAWN_INTERVAL = 5;
 const MIN_ICECREAM_SPAWN_INTERVAL = 2.5;
-// The original starts calm. Keep the shared 1× → 2× curve slow enough that
+// The original starts calm. Keep the world 1× → 2× curve slow enough that
 // the opening remains readable: 1.19× at 30s, 1.41× at 60s, 2× at 120s.
 const SPEED_DOUBLING_SECONDS = 120;
 const MAX_SPEED_MULTIPLIER = 2;
+// BGM follows the same intentional difficulty curve, but its instance is the
+// only rate source. The Sound and global library rates stay at 1×.
+const BGM_SPEED_UPDATE_EPSILON = 0.0025;
 const PLAYER_ROLL_RADIANS_PER_SECOND = Math.PI * 3;
 // IcecreamMove.cs starts at 9 world units/second. In this 1920px scene that
 // is roughly 1,500px/s before the shared difficulty multiplier applies.
@@ -103,13 +106,13 @@ type GameTextures = Record<ImageAsset, Texture>;
 const SOUND_SOURCES = {
   bgm: {
     url: "/audio/bgm.mp3",
-    volume: 0.28,
+    volume: 0.46,
     loop: true,
     singleInstance: true,
   },
   start: {
     url: "/audio/game_start.mp3",
-    volume: 0.42,
+    volume: 0.26,
     singleInstance: true,
   },
   jump: {
@@ -207,11 +210,9 @@ class RollingRootGame {
   private gameOverFaceElapsed = 0;
   private isJumping = false;
   private audioUnlocked = false;
-  private audioResumePromise: Promise<boolean> | null = null;
-  private startCuePending = false;
+  private roundAudioStarted = false;
+  private audioGeneration = 0;
   private bgmInstance: IMediaInstance | null = null;
-  private bgmStarting = false;
-  private bgmRequestId = 0;
   private bootDismissed = false;
   private lastScreenWidth = 0;
   private lastScreenHeight = 0;
@@ -462,9 +463,7 @@ class RollingRootGame {
         PLAYER_ROLL_RADIANS_PER_SECOND * speedMultiplier * delta) %
       (Math.PI * 2);
     this.player.rotation = this.playerRollAngle;
-    if (this.bgmInstance) {
-      sound.speed("bgm", speedMultiplier);
-    }
+    this.updateBgmSpeed(speedMultiplier);
     this.updatePlayerPhysics(delta);
     this.updateObstacles(delta, speedMultiplier);
     this.updateBicycleSpawner(delta);
@@ -748,16 +747,14 @@ class RollingRootGame {
   }
 
   private jump(): void {
-    const audioReady = this.unlockAudio();
+    // The very first jump is also the browser's user gesture for game audio.
+    // Start the opening pair synchronously, then retain the normal jump cue.
+    this.beginRoundAudioFromGesture();
     if (this.isJumping) return;
 
     this.isJumping = true;
     this.playerVelocityY = JUMP_VELOCITY;
-    void audioReady.then((ready) => {
-      if (ready && this.state === "play") {
-        this.playEffect("jump");
-      }
-    });
+    this.playEffect("jump");
     this.setStatus("점프!");
   }
 
@@ -772,7 +769,7 @@ class RollingRootGame {
     this.setStatus("게임 시작. 탭 또는 아무 키를 눌러 아이스크림을 넘으세요.");
 
     if (userInitiated) {
-      this.startRoundAudio();
+      this.beginRoundAudioFromGesture();
     }
   }
 
@@ -793,10 +790,8 @@ class RollingRootGame {
     this.isJumping = false;
     this.player.position.set(PLAYER_X, playerGroundY());
     this.player.rotation = this.playerRollAngle;
-    this.stopBgm();
-    this.startCuePending = false;
+    this.stopRoundAudio();
     sound.stopAll();
-    sound.speed("bgm", 1);
     this.updateCamera();
     this.player.visible = true;
     this.obstacleLayer.visible = true;
@@ -819,12 +814,15 @@ class RollingRootGame {
 
     this.state = "play";
     this.pauseLayer.visible = false;
-    this.audioUnlocked = true;
-    void this.resumeAudioContext().then((ready) => {
-      if (ready && this.state === "play") {
+    this.resumeAudioFromGesture();
+    if (this.roundAudioStarted) {
+      if (this.bgmInstance) {
+        this.bgmInstance.speed = this.getSpeedMultiplier();
+        this.bgmInstance.paused = false;
+      } else {
         this.startBgm();
       }
-    });
+    }
     this.setStatus("게임을 계속합니다.");
   }
 
@@ -832,7 +830,7 @@ class RollingRootGame {
     if (this.state !== "play") return;
 
     this.state = "game-over";
-    this.stopBgm();
+    this.stopRoundAudio();
     this.playEffect("die");
     this.pauseLayer.visible = false;
     this.gameOverFaceElapsed = 0;
@@ -847,31 +845,29 @@ class RollingRootGame {
     );
   }
 
-  private unlockAudio(): Promise<boolean> {
-    const firstUnlock = !this.audioUnlocked;
+  private beginRoundAudioFromGesture(): void {
+    if (this.state !== "play" || this.roundAudioStarted) {
+      return;
+    }
+
+    const bgm = sound.find("bgm");
+    const start = sound.find("start");
+    if (!bgm.isPlayable || !start.isPlayable) {
+      this.handleAudioError(new Error("게임 오디오가 아직 준비되지 않았습니다."));
+      return;
+    }
+
     this.audioUnlocked = true;
-    return this.resumeAudioContext().then((ready) => {
-      if (!ready || this.state !== "play") {
-        return false;
-      }
+    this.roundAudioStarted = true;
+    const generation = ++this.audioGeneration;
 
-      if (firstUnlock) {
-        this.playStartCue();
-      } else if (!this.startCuePending) {
-        this.startBgm();
-      }
-
-      return true;
-    });
-  }
-
-  private startRoundAudio(): void {
-    this.audioUnlocked = true;
-    void this.resumeAudioContext().then((ready) => {
-      if (ready && this.state === "play") {
-        this.playStartCue();
-      }
-    });
+    // Keep resume and both source starts in the pointer/key handler's stack.
+    // Awaiting resume first can make Safari serialize (or drop) one of them.
+    this.resumeAudioFromGesture(generation);
+    this.stopBgm();
+    sound.stop("start");
+    this.startBgm();
+    this.playStartCue();
   }
 
   private playEffect(name: EffectSoundName): void {
@@ -888,134 +884,103 @@ class RollingRootGame {
       return;
     }
 
-    this.startCuePending = true;
+    if (!sound.find("start").isPlayable) {
+      this.handleAudioError(new Error("시작 효과음이 준비되지 않았습니다."));
+      return;
+    }
+
     sound.stop("start");
-    const playback = sound.play("start", {
-      singleInstance: true,
-      complete: () => {
-        this.startCuePending = false;
-        if (this.state === "play") {
-          this.startBgm();
-        }
-      },
-    });
+    const playback = sound.play("start", { singleInstance: true });
 
     if (playback instanceof Promise) {
-      void playback.catch((error: unknown) => {
-        this.startCuePending = false;
-        this.handleAudioError(error);
-        if (this.state === "play") {
-          this.startBgm();
-        }
-      });
+      void playback.catch((error: unknown) => this.handleAudioError(error));
     }
   }
 
   private startBgm(): void {
-    if (
-      !this.audioUnlocked ||
-      this.state !== "play" ||
-      this.startCuePending ||
-      this.bgmInstance ||
-      this.bgmStarting
-    ) {
+    if (!this.audioUnlocked || this.state !== "play" || this.bgmInstance) {
       return;
     }
 
-    const requestId = ++this.bgmRequestId;
-    this.bgmStarting = true;
+    if (!sound.find("bgm").isPlayable) {
+      this.handleAudioError(new Error("BGM이 준비되지 않았습니다."));
+      return;
+    }
+
     sound.stop("bgm");
-    sound.speed("bgm", this.getSpeedMultiplier());
+    // There are three @pixi/sound rate levels. Keep the parent and global
+    // levels fixed so the live BGM instance owns one absolute difficulty rate.
+    sound.speedAll = 1;
+    sound.speed("bgm", 1);
     const playback = sound.play("bgm", {
       loop: true,
       singleInstance: true,
+      speed: this.getSpeedMultiplier(),
     });
 
     if (playback instanceof Promise) {
       void playback
-        .then((instance) => this.registerBgmInstance(instance, requestId))
-        .catch((error: unknown) => {
-          if (requestId === this.bgmRequestId) {
-            this.bgmStarting = false;
-          }
-          this.handleAudioError(error);
-        });
+        .then((instance) => instance.stop())
+        .catch((error: unknown) => this.handleAudioError(error));
+      this.handleAudioError(new Error("BGM 재생이 사전 디코드보다 앞섰습니다."));
       return;
     }
 
-    this.registerBgmInstance(playback, requestId);
-  }
-
-  private registerBgmInstance(
-    instance: IMediaInstance,
-    requestId: number,
-  ): void {
-    if (
-      requestId !== this.bgmRequestId ||
-      !this.audioUnlocked ||
-      this.state !== "play"
-    ) {
-      instance.stop();
-      return;
-    }
-
-    this.bgmStarting = false;
-    this.bgmInstance?.stop();
-    this.bgmInstance = instance;
-    instance.once("stop", () => {
-      if (this.bgmInstance === instance) {
+    this.bgmInstance = playback;
+    playback.once("stop", () => {
+      if (this.bgmInstance === playback) {
         this.bgmInstance = null;
       }
     });
   }
 
   private stopBgm(): void {
-    this.bgmRequestId += 1;
-    this.bgmStarting = false;
     const instance = this.bgmInstance;
     this.bgmInstance = null;
     instance?.stop();
     sound.stop("bgm");
   }
 
-  private resumeAudioContext(): Promise<boolean> {
+  private updateBgmSpeed(speed: number): void {
+    if (
+      !this.bgmInstance ||
+      this.bgmInstance.paused ||
+      Math.abs(this.bgmInstance.speed - speed) < BGM_SPEED_UPDATE_EPSILON
+    ) {
+      return;
+    }
+
+    this.bgmInstance.speed = speed;
+  }
+
+  private stopRoundAudio(): void {
+    this.audioGeneration += 1;
+    this.roundAudioStarted = false;
+    this.stopBgm();
+    sound.stop("start");
+  }
+
+  private resumeAudioFromGesture(generation = this.audioGeneration): void {
     if (!sound.supported) {
-      sound.resumeAll();
-      return Promise.resolve(true);
+      return;
     }
 
     const audioContext = sound.context.audioContext;
     if (audioContext.state === "running") {
-      sound.resumeAll();
-      return Promise.resolve(true);
+      return;
     }
 
-    if (this.audioResumePromise) {
-      return this.audioResumePromise;
-    }
+    // Do not await here: this method is called directly by a tap/key handler,
+    // and the two opening sources are created immediately after this call.
+    void audioContext.resume().catch((error: unknown) => {
+      if (generation !== this.audioGeneration) {
+        return;
+      }
 
-    // Call resume synchronously from the tap/key handler, then wait before
-    // creating one-shot sources. Safari otherwise can drop the first sound.
-    this.audioResumePromise = audioContext
-      .resume()
-      .then(() => {
-        if (this.state !== "play") {
-          sound.pauseAll();
-          return false;
-        }
-
-        sound.resumeAll();
-        return true;
-      })
-      .catch((error: unknown) => {
-        this.handleAudioError(error);
-        return false;
-      })
-      .finally(() => {
-        this.audioResumePromise = null;
-      });
-
-    return this.audioResumePromise;
+      this.stopRoundAudio();
+      this.audioUnlocked = false;
+      this.handleAudioError(error);
+    });
   }
 
   private pauseActiveSounds(): void {
@@ -1023,12 +988,12 @@ class RollingRootGame {
       return;
     }
 
-    this.startCuePending = false;
-    this.stopBgm();
+    if (this.bgmInstance) {
+      this.bgmInstance.paused = true;
+    }
     (Object.keys(SOUND_SOURCES) as SoundName[])
       .filter((name): name is EffectSoundName => name !== "bgm")
       .forEach((name) => sound.stop(name));
-    sound.pauseAll();
   }
 
   private handleAudioError(error: unknown): void {
