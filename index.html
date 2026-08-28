@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ko" style="color-scheme: dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#8e2b2b" />
+    <meta name="description" content="406SOFT's Rolling Root" />
+    <link rel="icon" href="/favicon.png" type="image/png" sizes="512x512" />
+    <title>Rolling Root</title>
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <main id="game-shell" aria-label="Rolling Root 게임">
+      <section id="boot-splash" aria-label="406SOFT 시작 화면">
+        <div class="boot-content">
+          <img src="/images/406soft.png" alt="406soft" />
+          <p id="boot-error" class="boot-error" role="alert" hidden>
+            게임을 불러오지 못했습니다. 새로고침 후 다시 시도해 주세요.
+          </p>
+        </div>
+      </section>
+
+      <div id="game" aria-busy="true"></div>
+      <p id="game-status" class="sr-only" aria-live="polite"></p>
+    </main>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
