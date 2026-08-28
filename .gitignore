@@ -1,0 +1,34 @@
+# Build output
+dist/
+coverage/
+
+# Dependencies and tool caches
+node_modules/
+.vite/
+.eslintcache
+*.tsbuildinfo
+
+# Local environment files and secrets
+.env
+.env.*
+!.env.example
+
+# Logs and debug output
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS and editor metadata
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+
+# Local Codex/OMX runtime state
+.omx/
