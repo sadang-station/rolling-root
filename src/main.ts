@@ -7,6 +7,7 @@ import {
   Text,
   type Texture,
 } from "pixi.js";
+import { sound } from "@pixi/sound";
 
 // The Unity scene is a 16:9 orthographic composition: a white field, one
 // 13.6-degree plane, a fixed player, and obstacles that drift up the plane.
@@ -99,18 +100,42 @@ type GameState = "play" | "paused" | "game-over";
 type ImageAsset = "root" | "sad" | "icecream" | "bicycle";
 type GameTextures = Record<ImageAsset, Texture>;
 
+const SOUND_SOURCES = {
+  bgm: {
+    url: "/audio/bgm.mp3",
+    volume: 0.28,
+    loop: true,
+    singleInstance: true,
+  },
+  start: {
+    url: "/audio/game_start.mp3",
+    volume: 0.42,
+    singleInstance: true,
+  },
+  jump: {
+    url: "/audio/jump.mp3",
+    volume: 0.36,
+    singleInstance: true,
+  },
+  die: {
+    url: "/audio/die.mp3",
+    volume: 0.42,
+    singleInstance: true,
+  },
+  bicycle: {
+    url: "/audio/bicycle.mp3",
+    volume: 0.34,
+    singleInstance: true,
+  },
+} as const;
+
+type SoundName = keyof typeof SOUND_SOURCES;
+type EffectSoundName = Exclude<SoundName, "bgm">;
+
 interface Obstacle {
   kind: "icecream" | "bicycle";
   sprite: Sprite;
   scored: boolean;
-}
-
-interface SoundSet {
-  bgm: HTMLAudioElement;
-  start: HTMLAudioElement;
-  jump: HTMLAudioElement;
-  die: HTMLAudioElement;
-  bicycle: HTMLAudioElement;
 }
 
 interface Point {
@@ -188,14 +213,6 @@ class RollingRootGame {
   private viewportTop = 0;
   private viewportHeight = GAME_HEIGHT;
 
-  private readonly sounds: SoundSet = {
-    bgm: this.createAudio("/audio/bgm.mp3", 0.28, true),
-    start: this.createAudio("/audio/game_start.mp3", 0.42),
-    jump: this.createAudio("/audio/jump.mp3", 0.36),
-    die: this.createAudio("/audio/die.mp3", 0.42),
-    bicycle: this.createAudio("/audio/bicycle.mp3", 0.34),
-  };
-
   public constructor(
     private readonly mount: HTMLElement,
     private readonly bootSplash: HTMLElement,
@@ -205,7 +222,16 @@ class RollingRootGame {
   public async init(): Promise<void> {
     await document.fonts?.load('16px "One Mobile POP"');
     await Assets.init({ manifest: ASSET_MANIFEST });
-    this.textures = (await Assets.loadBundle("rolling-root")) as GameTextures;
+    // Pixi Sound uses Web Audio when available. Preload and decode every clip
+    // before the game starts so a jump only creates a ready-to-play instance.
+    if (sound.supported) {
+      sound.disableAutoPause = true;
+    }
+    const [textures] = await Promise.all([
+      Assets.loadBundle("rolling-root"),
+      this.loadSounds(),
+    ]);
+    this.textures = textures as GameTextures;
 
     await this.app.init({
       antialias: true,
@@ -291,17 +317,26 @@ class RollingRootGame {
     this.pauseGame();
   };
 
-  private createAudio(
-    src: string,
-    volume: number,
-    loop = false,
-  ): HTMLAudioElement {
-    const audio = new Audio(src);
-    audio.loop = loop;
-    audio.preload = "auto";
-    audio.volume = volume;
-    audio.load();
-    return audio;
+  private async loadSounds(): Promise<void> {
+    await Promise.all(
+      Object.entries(SOUND_SOURCES).map(
+        ([alias, source]) =>
+          new Promise<void>((resolve, reject) => {
+            sound.add(alias, {
+              ...source,
+              preload: true,
+              loaded: (error) => {
+                if (error) {
+                  reject(error);
+                  return;
+                }
+
+                resolve();
+              },
+            });
+          }),
+      ),
+    );
   }
 
   private buildPlayScene(): void {
@@ -422,7 +457,7 @@ class RollingRootGame {
         PLAYER_ROLL_RADIANS_PER_SECOND * speedMultiplier * delta) %
       (Math.PI * 2);
     this.player.rotation = this.playerRollAngle;
-    this.sounds.bgm.playbackRate = speedMultiplier;
+    sound.speed("bgm", speedMultiplier);
     this.updatePlayerPhysics(delta);
     this.updateObstacles(delta, speedMultiplier);
     this.updateBicycleSpawner(delta);
@@ -747,7 +782,8 @@ class RollingRootGame {
     this.isJumping = false;
     this.player.position.set(PLAYER_X, playerGroundY());
     this.player.rotation = this.playerRollAngle;
-    this.sounds.bgm.playbackRate = 1;
+    sound.stopAll();
+    sound.speed("bgm", 1);
     this.updateCamera();
     this.player.visible = true;
     this.obstacleLayer.visible = true;
@@ -771,6 +807,7 @@ class RollingRootGame {
     this.state = "play";
     this.pauseLayer.visible = false;
     this.audioUnlocked = true;
+    this.resumeAudioContext();
     this.playBgm();
     this.setStatus("게임을 계속합니다.");
   }
@@ -779,7 +816,7 @@ class RollingRootGame {
     if (this.state !== "play") return;
 
     this.state = "game-over";
-    this.pauseSound("bgm");
+    sound.stop("bgm");
     this.playEffect("die");
     this.pauseLayer.visible = false;
     this.gameOverFaceElapsed = 0;
@@ -797,6 +834,7 @@ class RollingRootGame {
   private unlockAudio(): void {
     const firstUnlock = !this.audioUnlocked;
     this.audioUnlocked = true;
+    this.resumeAudioContext();
     if (this.state === "play") {
       if (firstUnlock) {
         this.playEffect("start");
@@ -807,49 +845,76 @@ class RollingRootGame {
 
   private startRoundAudio(): void {
     this.audioUnlocked = true;
+    this.resumeAudioContext();
     if (this.state === "play") {
       this.playEffect("start");
       this.playBgm();
     }
   }
 
-  private playEffect(name: Exclude<keyof SoundSet, "bgm">): void {
+  private playEffect(name: EffectSoundName): void {
     if (!this.audioUnlocked) return;
 
-    const sound = this.sounds[name];
-    sound.currentTime = 0;
-    this.playAudio(sound);
+    this.playSound(name);
   }
 
   private playBgm(): void {
-    if (!this.audioUnlocked || !this.sounds.bgm.paused) {
+    if (!this.audioUnlocked) {
       return;
     }
 
-    this.playAudio(this.sounds.bgm);
+    const bgm = sound.find("bgm");
+    if (bgm.paused) {
+      sound.resume("bgm");
+    }
+
+    if (!bgm.isPlaying) {
+      this.playSound("bgm");
+    }
   }
 
-  private playAudio(sound: HTMLAudioElement): void {
-    void sound.play().catch((error: unknown) => {
-      if (error instanceof DOMException && error.name === "AbortError") {
-        return;
+  private playSound(name: SoundName): void {
+    const result = sound.play(name);
+    if (result instanceof Promise) {
+      void result.catch((error: unknown) => this.handleAudioError(error));
+    }
+  }
+
+  private resumeAudioContext(): void {
+    if (sound.supported) {
+      const audioContext = sound.context.audioContext;
+      if (
+        audioContext.state === "suspended" ||
+        audioContext.state === "interrupted"
+      ) {
+        // This call must stay inside the tap/key handler. Pixi Sound then
+        // refreshes its instances against the same resumed context below.
+        void audioContext.resume().catch((error: unknown) =>
+          this.handleAudioError(error),
+        );
       }
+    }
 
-      console.warn("오디오를 재생할 수 없습니다.", error);
-      this.setStatus(
-        "소리를 재생하지 못했습니다. 다음 입력에서 다시 시도합니다.",
-      );
-    });
-  }
-
-  private pauseSound(name: keyof SoundSet): void {
-    const sound = this.sounds[name];
-    sound.pause();
-    sound.currentTime = 0;
+    sound.resumeAll();
   }
 
   private pauseActiveSounds(): void {
-    Object.values(this.sounds).forEach((sound) => sound.pause());
+    if (!this.audioUnlocked) {
+      return;
+    }
+
+    sound.pause("bgm");
+    (Object.keys(SOUND_SOURCES) as SoundName[])
+      .filter((name): name is EffectSoundName => name !== "bgm")
+      .forEach((name) => sound.stop(name));
+    sound.pauseAll();
+  }
+
+  private handleAudioError(error: unknown): void {
+    console.warn("오디오를 재생할 수 없습니다.", error);
+    this.setStatus(
+      "소리를 재생하지 못했습니다. 다음 입력에서 다시 시도합니다.",
+    );
   }
 
   private dismissBootSplash(): void {
